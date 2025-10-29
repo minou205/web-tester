@@ -3,6 +3,7 @@
 
 import os
 import time
+import json
 from playwright.async_api import async_playwright
 from core.crawler import crawl_site
 from core.scenario_generator import generate_scenarios
@@ -19,7 +20,8 @@ async def run_full_scan(url, cfg):
     """
     ensure_dir(cfg.get("output_dir", "outputs"))
     pages = []
-    # Crawl
+
+    # ====================== 🕷️ STEP 1: CRAWL WEBSITE ======================
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=cfg.get("headless", True))
         context = await browser.new_context(user_agent=cfg.get("stealth", {}).get("user_agent"))
@@ -28,41 +30,72 @@ async def run_full_scan(url, cfg):
             await pg.goto(url, wait_until="domcontentloaded", timeout=cfg.get("nav_timeout_ms", 60000))
             await auto_pre_actions(pg, cfg)
             await pg.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Pre-scan load error: {e}")
+
         pages = await crawl_site(context, url, cfg, max_depth=cfg.get("crawl_max_depth", 2))
         await browser.close()
 
-    # collect fields
+    # ====================== 🧩 STEP 2: COLLECT FIELDS ======================
     all_fields = []
     for p in pages:
         all_fields.extend(p.get("fields", []))
     log.info(f"Total fields discovered: {len(all_fields)}")
 
-    # scenarios: generator is synchronous (LLM client sync), so call it normally
-    scenarios = generate_scenarios(all_fields, cfg)
+    # ====================== 🤖 STEP 3: GENERATE SCENARIOS (LLM) ======================
+    scenarios = []
+    try:
+        log.info("Generating test scenarios with LLM (Ollama)...")
+        raw = generate_scenarios(all_fields, cfg)
 
-    # execute scenarios (new browser instance)
+        if isinstance(raw, str):
+            # Try to parse raw JSON
+            try:
+                scenarios = json.loads(raw)
+                log.info(f"✅ Parsed {len(scenarios)} LLM scenarios successfully.")
+            except Exception:
+                log.warning("LLM output not valid JSON. Falling back to smart fallback generation.")
+                scenarios = generate_scenarios(all_fields, {**cfg, "force_fallback": True})
+        elif isinstance(raw, list):
+            scenarios = raw
+            log.info(f"✅ Received {len(scenarios)} structured scenarios from LLM.")
+        else:
+            log.warning("Unexpected LLM response type. Using fallback generator.")
+            scenarios = generate_scenarios(all_fields, {**cfg, "force_fallback": True})
+
+    except Exception as e:
+        log.error(f"LLM generation failed: {e}")
+        scenarios = generate_scenarios(all_fields, {**cfg, "force_fallback": True})
+
+    # ====================== ⚙️ STEP 4: EXECUTE SCENARIOS ======================
     results_exec = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=cfg.get("headless", True))
         context = await browser.new_context(user_agent=cfg.get("stealth", {}).get("user_agent"))
         for pg in pages:
-            page = await context.new_page()
+            page_url = pg.get("url")
             try:
-                await page.goto(pg.get("url"), wait_until="load", timeout=cfg.get("nav_timeout_ms", 60000))
+                page = await context.new_page()
+                await page.goto(page_url, wait_until="load", timeout=cfg.get("nav_timeout_ms", 60000))
                 await auto_pre_actions(page, cfg)
+
+                # Match scenarios by selector
                 page_selectors = [f.get("selector") for f in pg.get("fields", [])]
-                page_scs = [s for s in scenarios if s.get("selector") in page_selectors]
-                exec_res = await execute_scenarios_on_page(page, page_scs, cfg)
-                results_exec.append({"page": pg.get("url"), "results": exec_res})
+                page_scenarios = [s for s in scenarios if s.get("selector") in page_selectors]
+
+                exec_res = await execute_scenarios_on_page(page, page_scenarios, cfg)
+                results_exec.append({"page": page_url, "results": exec_res})
+
             except Exception as e:
-                log.warning(f"Execution error for {pg.get('url')}: {e}")
+                log.warning(f"Execution error for {page_url}: {e}")
             finally:
-                try: await page.close()
-                except: pass
+                try:
+                    await page.close()
+                except:
+                    pass
         await browser.close()
 
+    # ====================== 🧾 STEP 5: BUILD REPORTS ======================
     report = {
         "target_url": url,
         "pages": pages,
@@ -71,6 +104,8 @@ async def run_full_scan(url, cfg):
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "issues": []
     }
+
     build_reports(report, output_dir=cfg.get("output_dir", "outputs"))
-    save_json(report, os.path.join(cfg.get("output_dir","outputs"), "last_scan_summary.json"))
+    save_json(report, os.path.join(cfg.get("output_dir", "outputs"), "last_scan_summary.json"))
+    log.info("✅ Full scan completed successfully.")
     return report
