@@ -23,7 +23,7 @@ element_query_timeout_ms: 3000
 llm:
   provider: "ollama"
   ollama_model: "llama3.1:8b"
-  ollama_endpoint: "http://localhost:11434/api/generate"
+  ollama_endpoint: "http://127.0.0.1:11434/api/generate"
   timeout: 120
   max_retries: 2
 
